@@ -540,189 +540,63 @@ def handle_email_sent_to_ourself(alias, from_addr: str, msg: Message, user):
     )
 
 
+from app.handler.steps.context import EmailProcessingContext
+from app.handler.steps.pipeline import EmailProcessingPipeline
+from app.handler.steps.alias_resolution import AliasResolutionStep
+from app.handler.steps.contact_management import ContactManagementStep
+from app.handler.steps.security_validation import SecurityValidationStep
+from app.handler.steps.header_rewriting import HeaderRewritingStep
+from app.handler.steps.pgp_encryption import PgpEncryptionStep
+from app.handler.steps.delivery import DeliveryStep
+
+def _get_pipeline() -> EmailProcessingPipeline:
+    return EmailProcessingPipeline([
+        AliasResolutionStep(),
+        ContactManagementStep(),
+        SecurityValidationStep(),
+        HeaderRewritingStep(),
+        PgpEncryptionStep(),
+        DeliveryStep(),
+    ])
+
 @sentry_sdk.trace
 def handle_forward(envelope, msg: Message, rcpt_to: str) -> List[Tuple[bool, str]]:
     """return an array of SMTP status (is_success, smtp_status)
     is_success indicates whether an email has been delivered and
     smtp_status is the SMTP Status ("250 Message accepted", "550 Non-existent email address", etc.)
     """
-    alias_address = rcpt_to  # alias@SL
-
-    alias = Alias.get_by(email=alias_address)
-    if not alias:
-        LOG.d(
-            "alias %s not exist. Try to see if it can be created on the fly",
-            alias_address,
-        )
-        alias = try_auto_create(alias_address)
-        if not alias:
-            LOG.d("alias %s cannot be created on-the-fly, return 550", alias_address)
-            if should_ignore_bounce(envelope.mail_from):
-                return [(True, status.E207)]
-            else:
-                return [(False, status.E515)]
-
-    user = alias.user
-
-    if not user.is_active():
-        LOG.w(f"User {user} has been soft deleted")
-        return [(False, status.E502)]
-
-    if not user.can_send_or_receive():
-        LOG.i(f"User {user} cannot receive emails")
-        if should_ignore_bounce(envelope.mail_from):
-            return [(True, status.E207)]
-        else:
-            return [(False, status.E504)]
-
-    if alias.custom_domain_id and not alias.custom_domain.verified:
-        LOG.w("Alias %s is on unverified custom domain, refusing email", alias)
-        return [(False, status.E520)]
-
-    # check if email is sent from alias's owning mailbox(es)
-    mail_from = envelope.mail_from
-    for addr in alias.authorized_addresses():
-        # email sent from a mailbox to its alias
-        if addr == mail_from:
-            LOG.i("cycle email sent from %s to %s", addr, alias)
-            handle_email_sent_to_ourself(alias, addr, msg, user)
-            return [(True, status.E209)]
-
-    from_header = get_header_unicode(msg[headers.FROM])
-    LOG.d("Create or get contact for from_header:%s", from_header)
-    contact = get_or_create_contact(from_header, envelope.mail_from, alias)
-    if not contact:
-        return [(False, status.E504)]
-    alias = (
-        contact.alias
-    )  # In case the Session was closed in the get_or_create we re-fetch the alias
-
-    reply_to_contact = []
-    if msg[headers.REPLY_TO]:
-        reply_to_header_contents = get_header_unicode(msg[headers.REPLY_TO])
-        if reply_to_header_contents:
-            LOG.d(
-                "Create or get contact for reply_to_header:%s", reply_to_header_contents
-            )
-            for reply_to in [
-                reply_to.strip()
-                for reply_to in reply_to_header_contents.split(",")
-                if reply_to.strip()
-            ]:
-                try:
-                    reply_to_name, reply_to_email = parse_full_address(reply_to)
-                except ValueError:
-                    LOG.d(f"Could not parse reply-to address {reply_to}")
-                    continue
-                if reply_to_email == alias.email:
-                    LOG.i("Reply-to same as alias %s", alias)
-                else:
-                    reply_contact = get_or_create_reply_to_contact(
-                        reply_to_email, alias, msg
-                    )
-                    if reply_contact:
-                        reply_to_contact.append(reply_contact)
-
-    if alias.user.delete_on is not None:
-        LOG.d(f"user {user} is pending to be deleted. Do not forward")
-        EmailLog.create(
-            contact_id=contact.id,
-            user_id=contact.user_id,
-            blocked=True,
-            alias_id=contact.alias_id,
-            commit=True,
-        )
-        return [(True, status.E502)]
-
-    if not alias.enabled or alias.is_trashed() or contact.block_forward:
-        if not alias.enabled:
-            LOG.d("%s is disabled, do not forward", alias)
-
-        if alias.is_trashed():
-            LOG.d("%s is trashed, do not forward", alias)
-
-        if contact.block_forward:
-            LOG.d("Contact %s of alias %s is blocked, do not forward", contact, alias)
-
-        EmailLog.create(
-            contact_id=contact.id,
-            user_id=contact.user_id,
-            blocked=True,
-            alias_id=contact.alias_id,
-            commit=True,
-        )
-
-        # by default return 2** instead of 5** to allow user to receive emails again
-        # when alias is enabled or contact is unblocked
-        res_status = status.E200
-        if user.block_behaviour == BlockBehaviourEnum.return_5xx:
-            res_status = status.E502
-
-        return [(True, res_status)]
-
-    # Check if we need to reject or quarantine based on dmarc
-    msg, dmarc_delivery_status = apply_dmarc_policy_for_forward_phase(
-        alias, contact, envelope, msg
+    context = EmailProcessingContext(
+        envelope=envelope,
+        msg=msg,
+        rcpt_to=rcpt_to,
+        is_reply=False
     )
-    if dmarc_delivery_status is not None:
-        return [(False, dmarc_delivery_status)]
+    return _get_pipeline().execute(context)
 
-    ret = []
-    mailboxes = alias.mailboxes
+@sentry_sdk.trace
+def handle_reply(
+    envelope,
+    msg: Message,
+    rcpt_to: str,
+    notified_mailboxes: Set[int],
+) -> (bool, str):
+    """
+    Return whether an email has been delivered and
+    the smtp status ("250 Message accepted", "550 Non-existent email address", etc)
+    """
+    context = EmailProcessingContext(
+        envelope=envelope,
+        msg=msg,
+        rcpt_to=rcpt_to,
+        is_reply=True,
+        notified_mailboxes=notified_mailboxes
+    )
+    results = _get_pipeline().execute(context)
+    if results:
+        return results[0]
+    return False, status.E502
 
-    # no valid mailbox
-    if not mailboxes:
-        LOG.w("no valid mailboxes for %s", alias)
-        if should_ignore_bounce(envelope.mail_from):
-            return [(True, status.E207)]
-        else:
-            return [(False, status.E516)]
 
-    for mailbox in mailboxes:
-        if not mailbox.verified:
-            LOG.d("%s unverified, do not forward", mailbox)
-            ret.append((False, status.E517))
-        else:
-            # Check if the mailbox is also an alias and stop the loop
-            mailbox_as_alias = Alias.get_by(email=mailbox.email)
-            if mailbox_as_alias is not None:
-                LOG.info(
-                    f"Mailbox {mailbox.id} has email {mailbox.email} that is also alias {alias.id}. Stopping loop"
-                )
-                mailbox.verified = False
-                Session.commit()
-                mailbox_url = f"{config.URL}/dashboard/mailbox/{mailbox.id}/"
-                send_email_with_rate_control(
-                    user,
-                    config.ALERT_MAILBOX_IS_ALIAS,
-                    user.email,
-                    f"Your mailbox {mailbox.email} is an alias",
-                    render(
-                        "transactional/mailbox-invalid.txt.jinja2",
-                        user=mailbox.user,
-                        mailbox=mailbox,
-                        mailbox_url=mailbox_url,
-                        alias=alias,
-                    ),
-                    render(
-                        "transactional/mailbox-invalid.html",
-                        user=mailbox.user,
-                        mailbox=mailbox,
-                        mailbox_url=mailbox_url,
-                        alias=alias,
-                    ),
-                    max_nb_alert=1,
-                )
-                ret.append((False, status.E525))
-                continue
-            # create a copy of message for each forward
-            ret.append(
-                forward_email_to_mailbox(
-                    alias, copy(msg), contact, envelope, mailbox, user, reply_to_contact
-                )
-            )
-
-    return ret
 
 
 @sentry_sdk.trace
@@ -1037,180 +911,7 @@ def handle_reply(
     the smtp status ("250 Message accepted", "550 Non-existent email address", etc)
     """
 
-    reply_email = rcpt_to
 
-    reply_domain = get_email_domain_part(reply_email)
-
-    # reply_email must end with EMAIL_DOMAIN or a domain that can be used as reverse alias domain
-    if not reply_email.endswith(config.EMAIL_DOMAIN):
-        sl_domain: SLDomain = SLDomain.get_by(domain=reply_domain)
-        if sl_domain is None:
-            LOG.w(f"Reply email {reply_email} has wrong domain")
-            return False, status.E501
-
-    # handle case where reply email is generated with non-allowed char
-    reply_email = normalize_reply_email(reply_email)
-
-    contact = Contact.get_by(reply_email=reply_email)
-    if not contact:
-        LOG.w(f"No contact with {reply_email} as reverse alias")
-        return False, status.E502
-    if not contact.user.is_active():
-        LOG.w(f"User {contact.user} has been soft deleted")
-        return False, status.E502
-
-    alias = contact.alias
-
-    if alias.custom_domain_id and not alias.custom_domain.verified:
-        LOG.w("Alias %s is on unverified custom domain, refusing email", alias)
-        return False, status.E520
-
-    if alias.is_trashed():
-        LOG.d("%s is trashed, do not forward", alias)
-        return False, status.E502
-
-    alias_address: str = contact.alias.email
-    alias_domain = get_email_domain_part(alias_address)
-
-    # Sanity check: verify alias domain is managed by SimpleLogin
-    # scenario: a user have removed a domain but due to a bug, the aliases are still there
-    if not is_valid_alias_address_domain(alias.email):
-        LOG.e("%s domain isn't known", alias)
-        return False, status.E503
-
-    user = alias.user
-
-    if not user.can_send_or_receive():
-        LOG.i(f"User {user} cannot send emails")
-        return False, status.E504
-
-    # Check if we need to reject or quarantine based on dmarc
-    dmarc_delivery_status = apply_dmarc_policy_for_reply_phase(
-        alias, contact, envelope, msg
-    )
-    if dmarc_delivery_status is not None:
-        return False, dmarc_delivery_status
-
-    # Anti-spoofing
-    mailbox = get_mailbox_for_reply_phase(
-        envelope.mail_from, get_header_unicode(msg[headers.FROM]), alias
-    )
-    if not mailbox:
-        if alias.disable_email_spoofing_check:
-            # ignore this error, use default alias mailbox
-            LOG.w(
-                "ignore unknown sender to reverse-alias %s: %s -> %s",
-                envelope.mail_from,
-                alias,
-                contact,
-            )
-            mailbox = alias.mailbox
-        else:
-            # only mailbox can send email to the reply-email
-            handle_unknown_mailbox(envelope, msg, reply_email, user, alias, contact)
-            # return 2** to avoid Postfix sending out bounces and avoid backscatter issue
-            return False, status.E214
-
-    if mailbox.is_admin_disabled():
-        LOG.i(f"User {user} tried to send a mail from admin disabled mailbox {mailbox}")
-        return False, status.E207
-
-    if (
-        config.ENFORCE_SPF
-        and mailbox.force_spf
-        and not alias.disable_email_spoofing_check
-    ):
-        if not spf_pass(envelope, mailbox, user, alias, contact.website_email, msg):
-            # cannot use 4** here as sender will retry.
-            # cannot use 5** because that generates bounce report
-            return True, status.E201
-
-    email_log = EmailLog.create(
-        contact_id=contact.id,
-        alias_id=contact.alias_id,
-        is_reply=True,
-        user_id=contact.user_id,
-        mailbox_id=mailbox.id,
-        message_id=msg[headers.MESSAGE_ID],
-        commit=True,
-    )
-    LOG.d("Create %s for %s, %s, %s", email_log, contact, user, mailbox)
-
-    # Spam check
-    if config.ENABLE_SPAM_ASSASSIN:
-        spam_status = ""
-        is_spam = False
-
-        # do not use user.max_spam_score here
-        if config.SPAMASSASSIN_HOST:
-            start = time.time()
-            spam_score, spam_report = get_spam_score(msg, email_log)
-            LOG.d(
-                "%s -> %s - spam score %s in %s seconds. Spam report %s",
-                alias,
-                contact,
-                spam_score,
-                time.time() - start,
-                spam_report,
-            )
-            email_log.spam_score = spam_score
-            if spam_score > config.MAX_REPLY_PHASE_SPAM_SCORE:
-                is_spam = True
-                # only set the spam report for spam
-                email_log.spam_report = spam_report
-        else:
-            is_spam, spam_status = get_spam_info(
-                msg, max_score=config.MAX_REPLY_PHASE_SPAM_SCORE
-            )
-
-        if is_spam:
-            LOG.w(
-                "Email detected as spam. Reply phase. %s -> %s. Spam Score: %s, Spam Report: %s",
-                alias,
-                contact,
-                email_log.spam_score,
-                email_log.spam_report,
-            )
-
-            email_log.is_spam = True
-            email_log.spam_status = spam_status
-            Session.commit()
-
-            handle_spam(contact, alias, msg, user, mailbox, email_log, is_reply=True)
-            return False, status.E506
-
-    delete_all_headers_except(
-        msg,
-        [
-            headers.FROM,
-            headers.TO,
-            headers.CC,
-            headers.SUBJECT,
-            headers.DATE,
-            # do not delete original message id
-            headers.MESSAGE_ID,
-            # References and In-Reply-To are used for keeping the email thread
-            headers.REFERENCES,
-            headers.IN_REPLY_TO,
-            headers.SL_QUEUE_ID,
-        ]
-        + headers.MIME_HEADERS,
-    )
-
-    # Remove PGP public key attachments that could leak the user's real email address
-    if config.DROP_PGP_KEY_ATTACHMENTS_ON_REPLY:
-        msg = remove_sender_pgp_key_attachment(msg)
-
-    orig_to = msg[headers.TO]
-    orig_cc = msg[headers.CC]
-
-    # replace the reverse-alias by the contact email in the email body
-    # as this is usually included when replying
-    if user.replace_reverse_alias:
-        LOG.d("Replace reverse-alias %s by contact email %s", reply_email, contact)
-        msg = replace(msg, reply_email, contact.website_email)
-        LOG.d("Replace mailbox %s by alias email %s", mailbox.email, alias.email)
-        msg = replace(msg, mailbox.email, alias.email)
 
         if config.ENABLE_ALL_REVERSE_ALIAS_REPLACEMENT:
             start = time.time()
