@@ -1,0 +1,63 @@
+diff --git a/email_handler.py b/email_handler.py
+index 103996ce..b8c933d4 100644
+--- a/email_handler.py
++++ b/email_handler.py
+@@ -158,6 +158,11 @@ from app.pgp_utils import (
+ from app.utils import sanitize_email
+ from init_app import load_pgp_public_keys
+ from server import create_light_app
++from app.handler.steps import PGPEncryptor
++
++
++# Initialize PGP encryptor
++pgp_encryptor = PGPEncryptor()
+ 
+ 
+ @sentry_sdk.trace
+@@ -883,10 +888,20 @@ def forward_email_to_mailbox(
+         LOG.d("Encrypt message using mailbox %s", mailbox)
+ 
+         try:
+-            msg = prepare_pgp_message(
+-                msg, mailbox.pgp_finger_print, mailbox.pgp_public_key, can_sign=True
++            encrypted_msg = pgp_encryptor.encrypt(
++                msg, mailbox.pgp_finger_print, mailbox.pgp_public_key
+             )
+-        except PGPException:
++            if encrypted_msg is not None:
++                msg = encrypted_msg
++            else:
++                LOG.w(
++                    "Cannot encrypt message %s -> %s. %s %s", contact, alias, mailbox, user
++                )
++                msg = add_header(
++                    msg,
++                    f"""PGP encryption fails with {mailbox.email}'s PGP key""",
++                )
++        except Exception:
+             LOG.w(
+                 "Cannot encrypt message %s -> %s. %s %s", contact, alias, mailbox, user
+             )
+@@ -1241,10 +1256,20 @@ def handle_reply(
+     if contact.pgp_finger_print and user.is_premium():
+         LOG.d("Encrypt message for contact %s", contact)
+         try:
+-            msg = prepare_pgp_message(
++            encrypted_msg = pgp_encryptor.encrypt(
+                 msg, contact.pgp_finger_print, contact.pgp_public_key
+             )
+-        except PGPException:
++            if encrypted_msg is not None:
++                msg = encrypted_msg
++            else:
++                LOG.e(
++                    "Cannot encrypt message %s -> %s. %s %s", alias, contact, mailbox, user
++                )
++                # programming error, user shouldn't see a new email log
++                EmailLog.delete(email_log.id, commit=True)
++                # return 421 so the client can retry later
++                return False, status.E402
++        except Exception:
+             LOG.e(
+                 "Cannot encrypt message %s -> %s. %s %s", alias, contact, mailbox, user
+             )
